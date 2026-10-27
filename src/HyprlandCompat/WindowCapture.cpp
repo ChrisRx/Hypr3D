@@ -336,6 +336,52 @@ void finishSkirtMask(CWindowCapture::SSkirtState& state,
     }
 }
 
+// Holds the window's workspace render offset at `offset` (the off-screen
+// pull, or zero) for one snapshot pass, and puts it back after.
+//
+// The values go straight into the animated variable's storage rather than
+// through setValueAndWarp(). warp() ends the animation and fires its end
+// callback, so warping over a workspace mid-slide cut the slide short and
+// the restore then froze it wherever it had got to. A raw write leaves goal,
+// begin point and timer alone; the animation manager recomputes the value
+// from those on its next tick. Pinning to zero rather than leaving a slide's
+// offset in place also keeps the captured pixels where sampledBox says.
+//
+// m_floatingOffset is the window's own share of the same slide. An update
+// callback derives it from the offset, and a raw write does not run that
+// callback, so it is zeroed and restored alongside.
+class CRenderOffsetPin {
+  public:
+    CRenderOffsetPin(const PHLWINDOW& window, const Vector2D& offset) :
+        m_window(window), m_workspace(window ? window->m_workspace : nullptr) {
+        if (!m_workspace)
+            return;
+
+        m_offset         = m_workspace->m_renderOffset->value();
+        m_floatingOffset = window->m_floatingOffset;
+
+        m_workspace->m_renderOffset->value() = offset;
+        window->m_floatingOffset             = Vector2D{};
+    }
+
+    ~CRenderOffsetPin() {
+        if (!m_workspace)
+            return;
+
+        m_workspace->m_renderOffset->value() = m_offset;
+        m_window->m_floatingOffset           = m_floatingOffset;
+    }
+
+    CRenderOffsetPin(const CRenderOffsetPin&)            = delete;
+    CRenderOffsetPin& operator=(const CRenderOffsetPin&) = delete;
+
+  private:
+    PHLWINDOW    m_window;
+    PHLWORKSPACE m_workspace;
+    Vector2D     m_offset;
+    Vector2D     m_floatingOffset;
+};
+
 } // namespace
 
 bool CWindowCapture::makeSnapshot(const PHLWINDOW& window, const PHLMONITOR& monitor, bool force) {
@@ -402,18 +448,13 @@ bool CWindowCapture::makeSnapshot(const PHLWINDOW& window, const PHLMONITOR& mon
             shift.y = -BOTTOM;
     }
 
-    const bool     SHIFTED  = shift.x != 0.0 || shift.y != 0.0;
-    const Vector2D ORIGINAL = WORKSPACE ? WORKSPACE->m_renderOffset->value() : Vector2D{};
-
-    if (SHIFTED)
-        WORKSPACE->m_renderOffset->setValueAndWarp(shift);
-
     // Renders the window (content + decorations) into a fresh plugin-ownable
     // framebuffer. Requires the window to currently pass shouldRenderWindow.
-    auto fb = g_pHyprRenderer->makeSnapshotFB(window);
-
-    if (SHIFTED)
-        WORKSPACE->m_renderOffset->setValueAndWarp(ORIGINAL);
+    SP<Render::IFramebuffer> fb;
+    {
+        const CRenderOffsetPin PIN{window, shift};
+        fb = g_pHyprRenderer->makeSnapshotFB(window);
+    }
 
     if (!fb)
         return false;
@@ -515,10 +556,6 @@ bool CWindowCapture::makeTiledSnapshot(
             return false;
     }
 
-    const auto WORKSPACE = window->m_workspace;
-    const Vector2D ORIGINAL =
-        WORKSPACE ? WORKSPACE->m_renderOffset->value() : Vector2D{};
-
     const int COLS = static_cast<int>(std::ceil(fullBox.w / MONLOGI.x));
     const int ROWS = static_cast<int>(std::ceil(fullBox.h / MONLOGI.y));
 
@@ -538,13 +575,11 @@ bool CWindowCapture::makeTiledSnapshot(
                 -fullBox.y - TILE_Y,
             };
 
-            if (WORKSPACE)
-                WORKSPACE->m_renderOffset->setValueAndWarp(shift);
-
-            auto fb = g_pHyprRenderer->makeSnapshotFB(window);
-
-            if (WORKSPACE)
-                WORKSPACE->m_renderOffset->setValueAndWarp(ORIGINAL);
+            SP<Render::IFramebuffer> fb;
+            {
+                const CRenderOffsetPin PIN{window, shift};
+                fb = g_pHyprRenderer->makeSnapshotFB(window);
+            }
 
             if (!fb)
                 continue; // hole in the composite; next frame retries
