@@ -192,6 +192,8 @@ Everything is optional -- only set what you want to change.
 | spawn_distance | float              | 5.0        | how far from you new windows appear (m)  |
 | depth          | float              | 0.05       | window slab thickness (0 = flat quads)   |
 | spawn_size     | [Vector2](#vector) | {960, 540} | size of windows spawned while 3D is open |
+| all_workspaces | bool               | false      | every workspace of the monitor at once, one frame each on the walls of a room around you. windows follow their live 2D layout; aiming at one on another workspace for a moment switches to it |
+| wall_scale     | float              | 0.35       | window size multiplier for windows mounted on a wall (all_workspaces) |
 
 ### Input
 

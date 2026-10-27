@@ -39,8 +39,12 @@ struct SWindowInfo {
 // `underLayers` (world.under_layers): the room is drawn under the top and
 // overlay layers, so only bottom-layer surfaces join it; otherwise every
 // layer above the background does.
+// `allWorkspaces` (windows.all_workspaces): windows on every regular
+// workspace of `monitor` qualify, shown or not. The capture pins a hidden
+// workspace on-screen for its pass (see CWorkspaceRenderPin).
 std::vector<SWindowInfo> enumerateEligibleWindows(const PHLMONITOR& monitor,
-                                                  bool underLayers = false);
+                                                  bool underLayers = false,
+                                                  bool allWorkspaces = false);
 
 // True if the window still belongs to the eligible set (mapped, not hidden).
 bool isWindowEligible(const PHLWINDOW& window, const PHLMONITOR& monitor);

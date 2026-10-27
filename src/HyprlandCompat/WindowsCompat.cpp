@@ -37,7 +37,8 @@ static bool onRoomWorkspace(const PHLWINDOW& window, const PHLMONITOR& monitor) 
 }
 
 std::vector<SWindowInfo> enumerateEligibleWindows(const PHLMONITOR& monitor,
-                                                  bool underLayers) {
+                                                  bool underLayers,
+                                                  bool allWorkspaces) {
     std::vector<SWindowInfo> out;
 
     if (!monitor || !Desktop::windowState())
@@ -57,7 +58,10 @@ std::vector<SWindowInfo> enumerateEligibleWindows(const PHLMONITOR& monitor,
         if (WORKSPACE->m_monitor != monitor)
             continue;
 
-        if (!onRoomWorkspace(window, monitor))
+        // The all-workspaces room ghosts nothing, so the slide-out hazard
+        // onRoomWorkspace guards against does not apply to it.
+        if (!(allWorkspaces && !WORKSPACE->m_isSpecialWorkspace) &&
+            !onRoomWorkspace(window, monitor))
             continue;
 
         SWindowInfo info;

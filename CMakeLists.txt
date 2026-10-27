@@ -113,6 +113,7 @@ add_library(hypr3d SHARED
     src/World/Outline.cpp
     src/World/Picking.cpp
     src/World/ScreenProject.cpp
+    src/World/WallLayout.cpp
     src/World/World3D.cpp
     src/Input/InputController.cpp
     src/HyprlandCompat/WindowsCompat.cpp

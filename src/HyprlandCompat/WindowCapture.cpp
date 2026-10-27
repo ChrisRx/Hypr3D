@@ -336,8 +336,15 @@ void finishSkirtMask(CWindowCapture::SSkirtState& state,
     }
 }
 
-// Holds the window's workspace render offset at `offset` (the off-screen
-// pull, or zero) for one snapshot pass, and puts it back after.
+// Holds the window's workspace at rest and on-screen for one snapshot pass,
+// with its render offset at `offset` (the off-screen pull, or zero), and
+// puts it back after.
+//
+// makeSnapshotFB draws the window the way its workspace presents it right
+// now: shifted by m_renderOffset, faded by m_alpha, and not at all once
+// shouldRenderWindow decides the workspace is hidden. A window on a
+// workspace the monitor is not showing (windows.all_workspaces) fails all
+// three, so the pin overrides all three for the pass.
 //
 // The values go straight into the animated variable's storage rather than
 // through setValueAndWarp(). warp() ends the animation and fires its end
@@ -350,36 +357,44 @@ void finishSkirtMask(CWindowCapture::SSkirtState& state,
 // m_floatingOffset is the window's own share of the same slide. An update
 // callback derives it from the offset, and a raw write does not run that
 // callback, so it is zeroed and restored alongside.
-class CRenderOffsetPin {
+class CWorkspaceRenderPin {
   public:
-    CRenderOffsetPin(const PHLWINDOW& window, const Vector2D& offset) :
+    CWorkspaceRenderPin(const PHLWINDOW& window, const Vector2D& offset) :
         m_window(window), m_workspace(window ? window->m_workspace : nullptr) {
         if (!m_workspace)
             return;
 
         m_offset         = m_workspace->m_renderOffset->value();
+        m_alpha          = m_workspace->m_alpha->value();
+        m_force          = m_workspace->m_forceRendering;
         m_floatingOffset = window->m_floatingOffset;
 
         m_workspace->m_renderOffset->value() = offset;
+        m_workspace->m_alpha->value()        = 1.F;
+        m_workspace->m_forceRendering        = true;
         window->m_floatingOffset             = Vector2D{};
     }
 
-    ~CRenderOffsetPin() {
+    ~CWorkspaceRenderPin() {
         if (!m_workspace)
             return;
 
         m_workspace->m_renderOffset->value() = m_offset;
+        m_workspace->m_alpha->value()        = m_alpha;
+        m_workspace->m_forceRendering        = m_force;
         m_window->m_floatingOffset           = m_floatingOffset;
     }
 
-    CRenderOffsetPin(const CRenderOffsetPin&)            = delete;
-    CRenderOffsetPin& operator=(const CRenderOffsetPin&) = delete;
+    CWorkspaceRenderPin(const CWorkspaceRenderPin&)            = delete;
+    CWorkspaceRenderPin& operator=(const CWorkspaceRenderPin&) = delete;
 
   private:
     PHLWINDOW    m_window;
     PHLWORKSPACE m_workspace;
     Vector2D     m_offset;
     Vector2D     m_floatingOffset;
+    float        m_alpha = 1.F;
+    bool         m_force = false;
 };
 
 } // namespace
@@ -452,7 +467,7 @@ bool CWindowCapture::makeSnapshot(const PHLWINDOW& window, const PHLMONITOR& mon
     // framebuffer. Requires the window to currently pass shouldRenderWindow.
     SP<Render::IFramebuffer> fb;
     {
-        const CRenderOffsetPin PIN{window, shift};
+        const CWorkspaceRenderPin PIN{window, shift};
         fb = g_pHyprRenderer->makeSnapshotFB(window);
     }
 
@@ -577,7 +592,7 @@ bool CWindowCapture::makeTiledSnapshot(
 
             SP<Render::IFramebuffer> fb;
             {
-                const CRenderOffsetPin PIN{window, shift};
+                const CWorkspaceRenderPin PIN{window, shift};
                 fb = g_pHyprRenderer->makeSnapshotFB(window);
             }
 

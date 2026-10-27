@@ -27,6 +27,7 @@
 #include <hyprland/src/render/gl/GLFramebuffer.hpp>
 #include <hyprland/src/output/Monitor.hpp>
 #include <hyprland/src/desktop/view/Window.hpp>
+#include <hyprland/src/desktop/Workspace.hpp>
 #include <hyprland/src/managers/SeatManager.hpp>
 #include <hyprland/src/managers/eventLoop/EventLoopManager.hpp>
 #include <hyprland/src/managers/fullscreen/FullscreenController.hpp>
@@ -60,6 +61,7 @@ extern "C" {
 #include "Input/InputController.hpp"
 #include "World/MapCollision.hpp"
 #include "World/ScreenProject.hpp"
+#include "World/WallLayout.hpp"
 #include "World/World3D.hpp"
 #include "HyprlandCompat/WindowsCompat.hpp"
 #include "HyprlandCompat/FocusCompat.hpp"
@@ -149,6 +151,50 @@ static std::unordered_map<std::uintptr_t, CBox> g_roomBoxes;
 // in the set and stay).
 static std::unordered_set<std::uintptr_t> g_flagFloated;
 
+// --- all-workspaces room (windows.all_workspaces) ---------------------------
+//
+// The mode of the view that is open, latched at entry, and the frame layout
+// it was built with. The layout holds for the whole view: a workspace that
+// first appears while the view is open has no wall, and its windows come in
+// like any other new window, in front of the camera.
+//
+// Nothing is ghosted, driven or frozen in this mode. Lifting every window of
+// every workspace out of its layout and putting it back on exit would
+// re-tile all of them, so the layouts keep managing the windows and the
+// walls mirror them.
+static bool                g_allWorkspaces = false;
+static WallLayout::SLayout g_wallLayout;
+
+// What each wall-mounted window was last seated from. A window is re-seated
+// only when one of these changes (its workspace, its 2D box, its stacking),
+// so a Super+drag that carries it off the wall holds until the 2D layout
+// next moves it.
+struct SWallSeat {
+    WORKSPACEID workspace = WORKSPACE_INVALID;
+    CBox        box{};
+    int         rank = 0;
+};
+static std::unordered_map<std::uintptr_t, SWallSeat> g_wallSeats;
+
+// Seat depth in front of a frame face, past half the window slab
+// (windows.depth). Tiled windows share one plane (they never overlap),
+// floating ones stack a slab and a step above each other in 2D order, and a
+// fullscreen one above all of those.
+static constexpr float kSeatBase = 0.02f;
+static constexpr float kSeatStep = 0.012f;
+
+// Steady aim needed before a window on ANOTHER workspace takes focus (see
+// updateAimFocus). Focusing it switches the monitor to that workspace, and a
+// crosshair sweeping across the room would otherwise flip through every
+// workspace whose wall it passes over.
+static std::uintptr_t  g_dwellId   = 0;
+static float           g_dwellTime = 0.0f;
+static constexpr float kWorkspaceDwell = 0.25f;
+
+// That focus, once the dwell is over, waiting for the frame pump: it is
+// decided inside the frame but has to run outside it (see updateAimFocus).
+static PHLWINDOWREF g_pendingSwitchFocus;
+
 // --- 2D/3D independent positions + the view morph ---------------------------
 //
 // Positions are per-mode. The desktop keeps its own layout (ghosting
@@ -193,6 +239,8 @@ struct SViewMorphWin {
     SViewPose roomPose{}; // the room pose at s=1
     bool      animBox = false; // drive the real box between the two
     float     stack   = 0.f;   // world units toward the eye (2D stacking)
+    float     scale   = 0.f;   // room scale at s=1, 0 = window_scale (a
+                               // wall seat uses its frame's)
 };
 static std::unordered_map<std::uintptr_t, SViewMorphWin> g_viewMorphWins;
 
@@ -452,6 +500,18 @@ static bool        g_cfgUnderLayers = true;
 static float       g_cfgWindowScale   = 0.5f;    // room multiplier on window size
 static float       g_cfgSpawnDistance = 5.0f;    // units in front of the camera
 static float       g_cfgWindowDepth   = 0.05f;   // slab thickness, 0 = flat quads
+
+// windows.all_workspaces: every regular workspace of the monitor in the room
+// at once, each in a frame on its own wall (World/WallLayout.hpp), instead of
+// the active one alone. Read into g_allWorkspaces once per entry, so a reload
+// that flips it never changes the mode under an open view.
+static bool        g_cfgAllWorkspaces = false;
+
+// windows.wall_scale: room multiplier for wall-mounted windows; a frame is
+// the monitor's logical size times this. Separate from window_scale, which
+// keeps sizing what floats in front of the camera: layers, and windows on a
+// workspace that has no wall.
+static float       g_cfgWallScale = 0.35f;
 
 static void liftAboveFloor(Vec3& center, float height) {
     if (!g_cfgGrid)
@@ -1460,6 +1520,13 @@ static void startFramePump() {
                     return;
                 }
 
+                // A workspace switch the aim asked for from inside a frame
+                // (see updateAimFocus), run here where no frame is open.
+                if (const auto W = g_pendingSwitchFocus.lock()) {
+                    g_pendingSwitchFocus.reset();
+                    Compat::focusWindow(W);
+                }
+
                 // 2D passthrough: no damage (Hyprland renders by its own
                 // damage); the tick still polls the fullscreen state so the
                 // exit transition can fire.
@@ -1645,19 +1712,23 @@ static void serviceCapture() {
 
     g_capturing = true;
 
-    const auto INFOS = Compat::enumerateEligibleWindows(MON, g_cfgUnderLayers);
+    const auto INFOS = Compat::enumerateEligibleWindows(
+        MON, g_cfgUnderLayers, g_allWorkspaces);
 
+    // The all-workspaces room ghosts nothing; see g_allWorkspaces.
     if (g_viewMorphArmed) {
         // First pass of a fresh 3D session: capture the windows BEFORE the
         // ghosting touches them. The morph's takeoff frame must show the
         // 2D content sitting at the 2D rectangles -- then the ghosting
         // force-floats the windows and the real boxes follow the morph.
         refreshCaptures(INFOS, MON);
-        ghostWindows(MON, &INFOS);
+        if (!g_allWorkspaces)
+            ghostWindows(MON, &INFOS);
         buildEnterMorph(MON, INFOS);
         g_viewMorphArmed = false;
     } else {
-        ghostWindows(MON, &INFOS);
+        if (!g_allWorkspaces)
+            ghostWindows(MON, &INFOS);
         refreshCaptures(INFOS, MON);
     }
 
@@ -1698,11 +1769,44 @@ static void updateAimFocus(float dt) {
 
     const std::uintptr_t FOCUS = g_aim.update(AIMED, dt);
 
-    if (FOCUS == g_lastFocusId)
+    if (FOCUS == g_lastFocusId) {
+        g_dwellId = 0;
         return;
+    }
 
     const auto WINDOW =
         FOCUS != 0 ? Compat::findWindowById(FOCUS) : nullptr;
+
+    // A window on a workspace the monitor is not showing: focusing it is a
+    // workspace switch (fullWindowFocus calls changeWorkspace). Only once the
+    // aim has rested on it for kWorkspaceDwell (until then the previous focus
+    // stands), and never from here. This runs inside the frame
+    // (render.stage), and a switch relayouts the monitor and restarts its
+    // workspace animations, so the frame pump runs it instead, outside any
+    // frame, the same way requestDeactivate3D defers the exit teardown.
+    if (WINDOW && g_allWorkspaces && WINDOW->m_workspace &&
+        !WINDOW->m_workspace->isVisible()) {
+        if (g_dwellId != FOCUS) {
+            g_dwellId   = FOCUS;
+            g_dwellTime = 0.0f;
+        }
+
+        g_dwellTime += dt;
+
+        if (g_dwellTime < kWorkspaceDwell)
+            return;
+
+        g_dwellId            = 0;
+        g_pendingSwitchFocus = WINDOW;
+        g_lastFocusId        = FOCUS;
+
+        if (g_framePump)
+            g_framePump->updateTimeout(std::chrono::milliseconds(0));
+
+        return;
+    }
+
+    g_dwellId = 0;
 
     if (WINDOW) {
         Compat::focusWindow(WINDOW);
@@ -1717,6 +1821,7 @@ static void updateAimFocus(float dt) {
 // Raw (pre-smoothstep) fullscreen transition progress. Shared so syncWorld
 // and applyFullscreenAnimation agree on the same instant.
 static float smoothstep01(float x);
+static bool  boxesDiffer(const CBox& A, const CBox& B);
 
 static float fsRawProgress() {
     return std::clamp(
@@ -1733,6 +1838,99 @@ static float configWindowScale() {
     return g_cfgWindowScale;
 }
 
+// The workspaces that get a wall: every regular workspace of `mon` holding a
+// mapped window, plus the active one even when it is empty (it is where the
+// player came from, and where a window opened from inside the view lands).
+// In id order, which is the order the walls read in clockwise from the spawn.
+static std::vector<WallLayout::SWorkspace> wallWorkspaces(const PHLMONITOR& mon) {
+    std::vector<WallLayout::SWorkspace> out;
+
+    if (!mon)
+        return out;
+
+    const auto ADD = [&](const PHLWORKSPACE& ws) {
+        if (!ws || ws->m_isSpecialWorkspace || ws->m_monitor != mon)
+            return;
+
+        for (const auto& E : out)
+            if (E.id == ws->m_id)
+                return;
+
+        out.push_back({ws->m_id, ws->m_name});
+    };
+
+    ADD(mon->m_activeWorkspace);
+
+    if (Desktop::windowState())
+        for (const auto& W : Desktop::windowState()->windows())
+            if (W && W->m_isMapped && !W->isHidden())
+                ADD(W->m_workspace);
+
+    std::sort(out.begin(), out.end(),
+              [](const auto& A, const auto& B) { return A.id < B.id; });
+
+    return out;
+}
+
+// The frame a window hangs on in the all-workspaces room, if its workspace
+// has one.
+static const WallLayout::SFrame* wallFrameFor(const PHLWINDOW& window) {
+    if (!g_allWorkspaces || !window || !window->m_workspace)
+        return nullptr;
+
+    return g_wallLayout.find(window->m_workspace->m_id);
+}
+
+// The room pose of a window mounted on `frame` where it sits in 2D: its box
+// centre on the matching point of the frame, `rank` steps off the face (see
+// kSeatBase), facing into the room.
+static SViewPose wallSeatPose(
+    const WallLayout::SFrame& frame,
+    const CBox&               box,
+    int                       rank,
+    const PHLMONITOR&         mon
+) {
+    const float LIFT = g_cfgWindowDepth * 0.5f + kSeatBase +
+        static_cast<float>(rank) * (g_cfgWindowDepth + kSeatStep);
+
+    SViewPose pose;
+    pose.center = WallLayout::seat(
+        frame, static_cast<float>(box.x + box.w * 0.5),
+        static_cast<float>(box.y + box.h * 0.5),
+        static_cast<float>(mon->m_size.x), static_cast<float>(mon->m_size.y),
+        LIFT);
+    pose.yaw   = frame.yaw;
+    pose.pitch = 0.0f;
+    pose.roll  = 0.0f;
+    return pose;
+}
+
+// Stacking rank of each wall-mounted window, per workspace: 0 for tiled,
+// then the floating ones bottom to top (the window list is in 2D stacking
+// order), then a fullscreen one above them all.
+static std::unordered_map<std::uintptr_t, int> wallRanks(
+    const std::vector<Compat::SWindowInfo>& infos) {
+    std::unordered_map<std::uintptr_t, int> ranks;
+
+    if (!g_allWorkspaces)
+        return ranks;
+
+    std::unordered_map<WORKSPACEID, int> floating;
+
+    for (const auto& info : infos)
+        if (!info.isLayer && !info.attached && info.window &&
+            info.window->m_workspace && info.floating)
+            ranks[info.id] = ++floating[info.window->m_workspace->m_id];
+
+    for (const auto& info : infos)
+        if (!info.isLayer && !info.attached && info.window &&
+            info.window->m_workspace &&
+            Fullscreen::controller()->isFullscreen(info.window))
+            ranks[info.id] = floating[info.window->m_workspace->m_id] + 1;
+
+    return ranks;
+}
+
 static void syncWorld(const PHLMONITOR& mon, float dt) {
     // Deliberately free of side effects on the layout and the renderer. This
     // runs from render.stage, i.e. between the frame's startRenderPass() and
@@ -1742,7 +1940,8 @@ static void syncWorld(const PHLMONITOR& mon, float dt) {
     // monitor blur FBs; the compositor's outer endRender() then aborted in
     // CMonitor::useFP16(). Capture and ghosting therefore happen outside the
     // frame -- see serviceCapture().
-    auto INFOS = Compat::enumerateEligibleWindows(mon, g_cfgUnderLayers);
+    auto INFOS = Compat::enumerateEligibleWindows(
+        mon, g_cfgUnderLayers, g_allWorkspaces);
 
     // Attached surfaces (popups, X11 menus) come after every window, so each
     // finds its parent's entity already built this frame. An X11 menu whose
@@ -1777,6 +1976,8 @@ static void syncWorld(const PHLMONITOR& mon, float dt) {
     const float MONH = mon->m_size.y;
 
     const float WIN_SCALE = configWindowScale();
+
+    const auto WALL_RANKS = wallRanks(INFOS);
 
     std::vector<World3D::SEntity> ENTITIES;
     ENTITIES.reserve(INFOS.size());
@@ -1874,6 +2075,17 @@ static void syncWorld(const PHLMONITOR& mon, float dt) {
         // uniform so the captured content never distorts.
         entity.spawnScale = WIN_SCALE;
 
+        // A window whose workspace has a wall is mounted on it; everything
+        // else (layers, popups, workspaces newer than the view) enters the
+        // usual way. A mounted window takes its frame's scale, which was
+        // fixed with the frame at entry: a reload that changes wall_scale
+        // must not size windows off the frames they hang in.
+        const WallLayout::SFrame* FRAME =
+            info.isLayer || info.attached ? nullptr : wallFrameFor(info.window);
+
+        if (FRAME)
+            entity.spawnScale = FRAME->width / World3D::toWorld(MONW);
+
         // Seed pose: existing entities own their world position and rotation.
         // Next come the poses remembered from the last 3D session -- positions
         // are per-mode, so the room comes back exactly as it was left. NEW
@@ -1931,6 +2143,9 @@ static void syncWorld(const PHLMONITOR& mon, float dt) {
             entity.yaw = EXISTING->yaw;
             entity.pitch = EXISTING->pitch;
             entity.roll = EXISTING->roll;
+        }
+        else if (FRAME) {
+            // Seated on its wall below, once the size is known.
         }
         else if (const auto POSE = g_savedPoses.find(info.id);
                  POSE != g_savedPoses.end()) {
@@ -1999,6 +2214,34 @@ static void syncWorld(const PHLMONITOR& mon, float dt) {
 
         if (freshSpawn)
             liftAboveFloor(entity.center, entity.height);
+
+        // The wall seat follows the 2D state, not the snapshot's sampled box
+        // (that one is shifted whenever the capture had to pull the window
+        // on-screen), and is redone only when that state moves (see
+        // SWallSeat). The view morph owns the pose while it flies.
+        if (FRAME && !g_viewMorphWins.count(info.id)) {
+            const auto RANK_IT = WALL_RANKS.find(info.id);
+            const SWallSeat SEAT{
+                info.window->m_workspace->m_id,
+                SNAPSHOT->fullBox,
+                RANK_IT == WALL_RANKS.end() ? 0 : RANK_IT->second,
+            };
+
+            const auto OLD   = g_wallSeats.find(info.id);
+            const bool MOVED = OLD == g_wallSeats.end() ||
+                OLD->second.workspace != SEAT.workspace ||
+                OLD->second.rank != SEAT.rank ||
+                boxesDiffer(OLD->second.box, SEAT.box);
+
+            if (MOVED) {
+                const SViewPose POSE = wallSeatPose(*FRAME, SEAT.box, SEAT.rank, mon);
+                entity.center = POSE.center;
+                entity.yaw    = POSE.yaw;
+                entity.pitch  = POSE.pitch;
+                entity.roll   = POSE.roll;
+                g_wallSeats[info.id] = SEAT;
+            }
+        }
 
         // Fullscreen transition: the animation owns this quad's size, and it
         // MUST be applied here -- the draw list below is built from these
@@ -2527,8 +2770,11 @@ static void pollFullscreen() {
         std::chrono::duration<float>(FADE_NOW - g_fsFadeLast).count();
     g_fsFadeLast = FADE_NOW;
 
+    // The all-workspaces room has no passthrough (see below), so nothing
+    // fades: the other walls stay up whatever one workspace is doing.
     const float FADE_TARGET =
-        (FSW || g_fsPhase != EFullscreenPhase::None) ? 0.0f : 1.0f;
+        !g_allWorkspaces && (FSW || g_fsPhase != EFullscreenPhase::None) ?
+        0.0f : 1.0f;
 
     if (FADE_DT > 0.0f && g_fsFade != FADE_TARGET) {
         const float STEP = std::min(FADE_DT / FADE_DURATION, 1.0f);
@@ -2544,7 +2790,14 @@ static void pollFullscreen() {
             // passthrough on the first tick the room owns input. Marking it
             // handled here instead would leave the window monitor-sized in
             // the room forever -- the passthrough never running at all.
-            if (ownsInput())
+            //
+            // No passthrough in the all-workspaces room. It drives the real
+            // box toward the monitor and marks the window for a restore
+            // that only ghosted windows get; here nothing is ghosted. A
+            // fullscreen window shows the way 2D has it instead, covering
+            // its frame with everything else on that workspace behind it,
+            // and the real fullscreen is one exit away.
+            if (ownsInput() && !g_allWorkspaces)
                 startTo2D(FSW); // sets g_fsWasOn itself
         } else if (!FSW) {
             g_fsWasOn = false;
@@ -2811,11 +3064,13 @@ static bool boxesDiffer(const CBox& A, const CBox& B) {
 // rectangle is always the live box: the layout owns the real geometry in
 // both modes.
 static void buildEnterMorph(
-    const PHLMONITOR& /*mon*/, const std::vector<Compat::SWindowInfo>& infos) {
+    const PHLMONITOR& mon, const std::vector<Compat::SWindowInfo>& infos) {
     g_viewMorphWins.clear();
 
     const auto& CAM = g_scene.camera();
     const Vec3  FWD = CAM.forward();
+
+    const auto WALL_RANKS = wallRanks(infos);
 
     int i = 0;
 
@@ -2826,6 +3081,30 @@ static void buildEnterMorph(
 
         MW.box2D = SNAPSHOT ? SNAPSHOT->sampledBox : info.monitorLocalBox;
         MW.boxRoom = MW.box2D;
+
+        // The all-workspaces room: the shown workspace's windows fly from
+        // the screen onto their wall seats at their own size, and nothing is
+        // frozen or driven (see g_allWorkspaces). The other workspaces were
+        // never on screen, so they have nowhere to fly from: they fade in on
+        // their walls with the environment (see applyViewMorph).
+        if (const auto* FRAME =
+                info.isLayer || info.attached ? nullptr : wallFrameFor(info.window)) {
+            if (!info.window->m_workspace->isVisible())
+                continue;
+
+            const auto RANK_IT = WALL_RANKS.find(info.id);
+
+            MW.roomPose = wallSeatPose(
+                *FRAME, SNAPSHOT ? SNAPSHOT->fullBox : info.monitorLocalBox,
+                RANK_IT == WALL_RANKS.end() ? 0 : RANK_IT->second, mon);
+            MW.animBox = false;
+            MW.stack   = static_cast<float>(i) * kMorphStackEps;
+            MW.scale   = FRAME->width / World3D::toWorld(mon->m_size.x);
+            ++i;
+
+            g_viewMorphWins[info.id] = MW;
+            continue;
+        }
 
         if (const auto POSE = g_savedPoses.find(info.id);
             POSE != g_savedPoses.end()) {
@@ -2905,7 +3184,7 @@ static void beginExit3D() {
     // An interrupted ENTER morph contributes its intended room poses.
     const auto PREVIOUS = std::move(g_viewMorphWins);
 
-    if (!g_world.entities().empty())
+    if (!g_world.entities().empty() && !g_allWorkspaces)
         g_savedPoses.clear(); // rebuilt from the live room below; an empty
                               // room (toggled off before the first frame)
                               // keeps the previous session's memory
@@ -2915,6 +3194,33 @@ static void beginExit3D() {
 
     for (const auto& ENTITY : g_world.entities()) {
         SViewMorphWin MW;
+
+        // The all-workspaces room remembers nothing (the walls are rebuilt
+        // from the layouts every entry) and drives nothing, so a wall window
+        // lands on its live 2D box. Only the workspace being shown has
+        // somewhere to land; the rest fade out on their walls.
+        if (g_allWorkspaces && g_wallSeats.count(ENTITY.id)) {
+            const auto W = Compat::findWindowById(ENTITY.id);
+            if (!W || !W->m_workspace || !W->m_workspace->isVisible())
+                continue;
+
+            const auto* SNAPSHOT = g_capture.get(ENTITY.id);
+
+            MW.roomPose = SViewPose{
+                ENTITY.center, ENTITY.yaw, ENTITY.pitch, ENTITY.roll};
+            MW.boxRoom = SNAPSHOT ?
+                SNAPSHOT->sampledBox :
+                CBox{ENTITY.logicalLeft, ENTITY.logicalTop,
+                     ENTITY.logicalWidth, ENTITY.logicalHeight};
+            MW.box2D   = MW.boxRoom;
+            MW.animBox = false;
+            MW.stack   = static_cast<float>(i) * kMorphStackEps;
+            MW.scale   = ENTITY.spawnScale;
+            ++i;
+
+            g_viewMorphWins[ENTITY.id] = MW;
+            continue;
+        }
 
         // The intended room pose: mid-flight exits keep the destination.
         bool midEnter = false;
@@ -2960,7 +3266,8 @@ static void beginExit3D() {
 
         MW.roomPose.box = MW.boxRoom;
 
-        g_savedPoses[ENTITY.id] = MW.roomPose;
+        if (!g_allWorkspaces)
+            g_savedPoses[ENTITY.id] = MW.roomPose;
 
         // The 2D box the window must land on: the layout save. The
         // room-box enforcer refreshes it live whenever the tree re-asserts
@@ -3044,7 +3351,8 @@ static void applyViewMorphWindows(const PHLMONITOR& mon, float s) {
         }
 
         // Exact 1:1 on the frustum plane at s=0, the room scale at s=1.
-        const float SCALE = 1.0f + (configWindowScale() - 1.0f) * s;
+        const float ROOM_SCALE = MW.scale > 0.0f ? MW.scale : configWindowScale();
+        const float SCALE = 1.0f + (ROOM_SCALE - 1.0f) * s;
 
         const auto SP = ScreenProject::project(
             CAM.position, CAM.yaw, CAM.pitch, CAM.mirrorView, g_scene.zoom(),
@@ -3106,7 +3414,15 @@ static void applyViewMorph(const PHLMONITOR& mon) {
     // windows (an exposed desktop mid-flight would show them stacked under
     // the flying quads; the alpha channels cannot be forced quiet instead --
     // they bake into the snapshots). On the way OUT it mirrors the entrance.
-    g_scene.setEnvAlpha(smoothstep01(std::min(1.0f, RAW * 2.0f)));
+    const float ENV_ALPHA = smoothstep01(std::min(1.0f, RAW * 2.0f));
+    g_scene.setEnvAlpha(ENV_ALPHA);
+
+    // The all-workspaces walls that do not fly (the workspaces not on
+    // screen, see buildEnterMorph) come and go with the environment.
+    if (g_allWorkspaces)
+        for (auto& RW : g_renderWindows)
+            if (g_wallSeats.count(RW.id) && !g_viewMorphWins.count(RW.id))
+                RW.alpha *= ENV_ALPHA;
 
     applyViewMorphWindows(mon, g_morphS);
 
@@ -3434,10 +3750,14 @@ static void deactivate3D() {
     // session -- unless the exit morph already saved the poses (the entity
     // poses are at the screen endpoints by now). The camera pose rides the
     // same memory: the next entry resumes the walk, look angles included.
-    if (g_viewMorph != EViewMorph::To2D)
+    //
+    // Neither applies to the all-workspaces room: its walls and its standing
+    // point are rebuilt every entry, and saving them would hand the plain
+    // room a camera inside a wall that is not there.
+    if (g_viewMorph != EViewMorph::To2D && !g_allWorkspaces)
         saveViewPoses();
 
-    {
+    if (!g_allWorkspaces) {
         const auto& CAM = g_scene.camera();
         g_savedCamPos   = CAM.position;
         g_savedCamYaw   = CAM.yaw;
@@ -3455,6 +3775,12 @@ static void deactivate3D() {
     g_flagFloated.clear();
     g_sessionWindows.clear();
     g_capture.setSkirtDeferred(false);
+
+    g_pendingSwitchFocus.reset();
+    g_allWorkspaces = false;
+    g_wallLayout    = {};
+    g_wallSeats.clear();
+    g_dwellId = 0;
 
     // Fullscreen passthrough state: back to plain 3D-off. Restore the real
     // box if a transition was mid-flight (the window would otherwise stay
@@ -3620,6 +3946,40 @@ static void enter3D() {
         }
     }
 
+    // windows.all_workspaces: the room is built from the workspaces as they
+    // stand right now, and the player stands in the middle of it facing the
+    // active one. Neither player.spawn nor the last session's camera applies:
+    // both are points on the open grid, and inside a room sized by the
+    // workspace count they land in a wall as often as not.
+    g_allWorkspaces = g_cfgAllWorkspaces;
+    g_wallLayout    = {};
+    g_wallSeats.clear();
+    g_dwellId = 0;
+    g_pendingSwitchFocus.reset();
+
+    if (const auto MON = targetMonitor(); MON && g_allWorkspaces) {
+        g_wallLayout = WallLayout::compute(
+            wallWorkspaces(MON),
+            World3D::toWorld(static_cast<float>(MON->m_size.x)) * g_cfgWallScale,
+            World3D::toWorld(static_cast<float>(MON->m_size.y)) * g_cfgWallScale);
+
+        auto& CAM    = g_scene.camera();
+        CAM.position = Vec3{0.0f, Camera::kFloorY + Camera::kEyeHeight, 0.0f};
+        CAM.pitch    = 0.0f;
+
+        const auto* ACTIVE = MON->m_activeWorkspace ?
+            g_wallLayout.find(MON->m_activeWorkspace->m_id) :
+            nullptr;
+
+        if (ACTIVE) {
+            // Inverse of Camera::forward(): {sin yaw cos pitch, sin pitch,
+            // -cos yaw cos pitch}.
+            const Vec3 TO = normalize(ACTIVE->center - CAM.position);
+            CAM.yaw   = std::atan2(TO.x, -TO.z);
+            CAM.pitch = std::asin(std::clamp(TO.y, -1.0f, 1.0f));
+        }
+    }
+
     g_capture.releaseAll();
 
     resetMovementKeys();
@@ -3650,9 +4010,13 @@ static void enter3D() {
     // force-floated and ghosted, so the saved tree is not disturbed by the
     // shrink, and the exit restores it as a floating panel (the FS exit
     // path asserts that size).
+    //
+    // Not in the all-workspaces room: the window keeps its fullscreen, and
+    // its frame shows it that way (see pollFullscreen).
         if (const auto MON = targetMonitor()) {
             if (const auto FSW =
-                    Fullscreen::controller()->getFullscreenWindow(MON)) {
+                    Fullscreen::controller()->getFullscreenWindow(MON);
+                FSW && !g_allWorkspaces) {
                 const double PX =
                     MON->m_size.x * 0.5 - g_cfgSpawnWidth * 0.5;
                 const double PY =
@@ -5882,9 +6246,14 @@ static void onMouseButton(
 
         // Resize is a window-only control: a scene model in front of the
         // crosshair must not let the gesture reach a window behind it.
+        //
+        // In the all-workspaces room it is a floating-window control too: a
+        // tiled window's size belongs to its layout there, and nothing would
+        // undo a room-only resize of one on exit.
         if (event.button == BTN_RIGHT) {
-            if (!TARGET.window || modelInFront(CAM.position,
-                                               CAM.centerRay(), HIT)) {
+            if (!TARGET.window ||
+                (g_allWorkspaces && !TARGET.window->m_isFloating) ||
+                modelInFront(CAM.position, CAM.centerRay(), HIT)) {
                 info.cancelled = true;
                 return;
             }
@@ -6226,6 +6595,11 @@ static int luaConfig(lua_State* L) {
     //                                       -- units (0 = flat quads; walls
     //                                       -- follow rounded corners and
     //                                       -- show the texture's edge)
+    //         all_workspaces = false,       -- every workspace of the monitor
+    //                                       -- at once, one wall each,
+    //                                       -- player in the middle
+    //         wall_scale = 0.35,            -- room multiplier for windows
+    //                                       -- mounted on a wall
     //     },
     //     player = {
     //         look_sensitivity = 0.0025,    -- radians per pointer count
@@ -6402,6 +6776,14 @@ static int luaConfig(lua_State* L) {
         if (!SET_NUM(idx, "depth", g_cfgWindowDepth,
                      "windows.depth"))
             return luaL_error(L, "hypr3d.config: windows.depth must be a number");
+
+        // Both take effect on the next entry, not under an open view: the
+        // room is laid out once, at entry (see enter3D).
+        if (!SET_BOOL(idx, "all_workspaces", g_cfgAllWorkspaces,
+                      "windows.all_workspaces"))
+            return luaL_error(L, "hypr3d.config: windows.all_workspaces must be a boolean");
+        if (!SET_NUM(idx, "wall_scale", g_cfgWallScale, "windows.wall_scale"))
+            return luaL_error(L, "hypr3d.config: windows.wall_scale must be a number");
 
         // windows.spawn_size = { x = 960, y = 540 }: the logical box a
         // window that appears while the view is open starts at.
