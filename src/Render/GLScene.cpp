@@ -2119,6 +2119,15 @@ void GLScene::drawHouse(const Mat4& vp) {
     glDepthMask(GL_TRUE);
     glDisable(GL_BLEND);
 
+    // Windows hang millimetres off the frames (see WallLayout::kWindowLift),
+    // which far across a large room is close to the depth resolution. The
+    // offset pushes the whole house, screens included, a few depth steps
+    // back, so a window always wins against the wall it hangs on at any
+    // distance and angle. Screen against bezel keeps its own lift, since
+    // both get the same offset.
+    glEnable(GL_POLYGON_OFFSET_FILL);
+    glPolygonOffset(1.0f, 4.0f);
+
     glUseProgram(m_houseProgram);
     glUniformMatrix4fv(m_houseMVP, 1, GL_FALSE, vp.m.data());
     glUniform1f(m_houseActiveU, static_cast<float>(m_houseActive));
@@ -2152,6 +2161,9 @@ void GLScene::drawHouse(const Mat4& vp) {
             drawQuad(m_quadVAO, m_quadVertexCount, vp * MODEL, 0, DARK_UV,
                      0.02f, 0.025f, 0.035f, 1.f);
     }
+
+    glDisable(GL_POLYGON_OFFSET_FILL);
+    glPolygonOffset(0.0f, 0.0f);
 }
 
 // Restored from the pre-unification revision: the black cross with the

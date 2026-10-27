@@ -178,12 +178,33 @@ struct SWallSeat {
 };
 static std::unordered_map<std::uintptr_t, SWallSeat> g_wallSeats;
 
-// Seat depth in front of a frame face, past half the window slab
-// (windows.depth). Tiled windows share one plane (they never overlap),
-// floating ones stack a slab and a step above each other in 2D order, and a
-// fullscreen one above all of those.
-static constexpr float kSeatBase = 0.02f;
-static constexpr float kSeatStep = 0.012f;
+// Seat depth in front of a frame face. Wall windows are flat (no
+// windows.depth slab) and sit almost on the face: anything nearer the camera
+// than the frame is magnified by perspective, and a few centimetres already
+// pushed a window visibly past its frame's edges. Tiled windows share one
+// plane (they never overlap) clear of the house screen behind them (see
+// WallLayout::kScreenLift), floating ones stack a step above each other in
+// 2D order, and a fullscreen one above all of those.
+static constexpr float kSeatBase = WallLayout::kWindowLift;
+static constexpr float kSeatStep = 0.008f;
+
+// The monitor's work area, monitor-local: the monitor minus what layer
+// surfaces reserve (the bar). A frame stands for this rather than the whole
+// monitor, so the tiles fill it the way they fill the screen. Latched at
+// entry with the layout.
+static CBox     g_wallWork;
+static Vector2D g_wallMonSize;
+
+// The camera flight of the all-workspaces view morph (see applyWallCamera):
+// from the pose where the active frame exactly fills the view (s = 0, the 2D
+// handoff) to the pose in the room (s = 1).
+struct SWallCamPose {
+    Vec3  position{};
+    float yaw   = 0.f;
+    float pitch = 0.f;
+};
+static SWallCamPose g_wallCamNear;
+static SWallCamPose g_wallCamFar;
 
 // Steady aim needed before a window on ANOTHER workspace takes focus (see
 // updateAimFocus). Focusing it switches the monitor to that workspace, and a
@@ -260,8 +281,6 @@ struct SViewMorphWin {
     SViewPose roomPose{}; // the room pose at s=1
     bool      animBox = false; // drive the real box between the two
     float     stack   = 0.f;   // world units toward the eye (2D stacking)
-    float     scale   = 0.f;   // room scale at s=1, 0 = window_scale (a
-                               // wall seat uses its frame's)
 };
 static std::unordered_map<std::uintptr_t, SViewMorphWin> g_viewMorphWins;
 
@@ -2023,27 +2042,76 @@ static const WallLayout::SFrame* wallFrameFor(const PHLWINDOW& window) {
 }
 
 // The room pose of a window mounted on `frame` where it sits in 2D: its box
-// centre on the matching point of the frame, `rank` steps off the face (see
-// kSeatBase), facing into the room.
+// centre on the matching point of the frame (which stands for g_wallWork),
+// `rank` steps off the face (see kSeatBase), facing into the room.
 static SViewPose wallSeatPose(
     const WallLayout::SFrame& frame,
     const CBox&               box,
-    int                       rank,
-    const PHLMONITOR&         mon
+    int                       rank
 ) {
-    const float LIFT = g_cfgWindowDepth * 0.5f + kSeatBase +
-        static_cast<float>(rank) * (g_cfgWindowDepth + kSeatStep);
+    const float LIFT = kSeatBase + static_cast<float>(rank) * kSeatStep;
 
     SViewPose pose;
     pose.center = WallLayout::seat(
-        frame, static_cast<float>(box.x + box.w * 0.5),
-        static_cast<float>(box.y + box.h * 0.5),
-        static_cast<float>(mon->m_size.x), static_cast<float>(mon->m_size.y),
+        frame, static_cast<float>(box.x - g_wallWork.x + box.w * 0.5),
+        static_cast<float>(box.y - g_wallWork.y + box.h * 0.5),
+        static_cast<float>(g_wallWork.w), static_cast<float>(g_wallWork.h),
         LIFT);
     pose.yaw   = frame.yaw;
     pose.pitch = 0.0f;
     pose.roll  = 0.0f;
     return pose;
+}
+
+// A camera at `position` looking at `target`. Inverse of Camera::forward():
+// {sin yaw cos pitch, sin pitch, -cos yaw cos pitch}.
+static SWallCamPose wallCamLookingAt(const Vec3& position, const Vec3& target) {
+    const Vec3 TO = normalize(target - position);
+    return {position, std::atan2(TO.x, -TO.z),
+            std::asin(std::clamp(TO.y, -1.0f, 1.0f))};
+}
+
+// Square in front of `frame`, exactly where the whole monitor, extended past
+// the frame's work area by the reserved strips, would fill the view. Every
+// window on the frame then covers the pixels it covers in 2D, so this is
+// where the view morph hands over between 2D and the room. Kept inside the
+// room when the frame is too large for that.
+static SWallCamPose wallCamFilling(const WallLayout::SFrame& frame) {
+    const float TAN = std::tan(kFovDeg * 3.14159265f / 360.0f) /
+        std::max(g_scene.zoom(), 0.01f);
+    const float DEPTH =
+        2.0f * (frame.wall % 2 == 0 ? g_wallLayout.halfZ : g_wallLayout.halfX);
+
+    // World units per logical px on the frame, and the monitor's centre
+    // relative to the work area's (y grows down in px, up in the world).
+    const float PER = frame.width / static_cast<float>(g_wallWork.w);
+    const float DX  = static_cast<float>(g_wallMonSize.x * 0.5 -
+                                        (g_wallWork.x + g_wallWork.w * 0.5));
+    const float DY  = static_cast<float>(g_wallMonSize.y * 0.5 -
+                                        (g_wallWork.y + g_wallWork.h * 0.5));
+    const Vec3  TARGET =
+        frame.center + frame.right * (DX * PER) + Vec3{0.0f, -DY * PER, 0.0f};
+
+    const float BACK =
+        std::min(static_cast<float>(g_wallMonSize.y) * PER * 0.5f / TAN + kSeatBase,
+                 DEPTH - 0.5f);
+
+    return wallCamLookingAt(TARGET + frame.normal * BACK, TARGET);
+}
+
+// Where the entry morph backs away to: most of the way across the room from
+// `frame`, at eye height, still looking at it.
+static SWallCamPose wallCamRoom(const WallLayout::SFrame& frame) {
+    const float DEPTH =
+        2.0f * (frame.wall % 2 == 0 ? g_wallLayout.halfZ : g_wallLayout.halfX);
+    const Vec3  FILL = wallCamFilling(frame).position - frame.center;
+    const float BACK = std::max(std::sqrt(dot(FILL, FILL)),
+                                std::min(DEPTH * 0.75f, DEPTH - 1.0f));
+
+    Vec3 position = frame.center + frame.normal * BACK;
+    position.y    = Camera::kFloorY + Camera::kEyeHeight;
+
+    return wallCamLookingAt(position, frame.center);
 }
 
 // Stacking rank of each wall-mounted window, per workspace: 0 for tiled,
@@ -2225,7 +2293,7 @@ static void syncWorld(const PHLMONITOR& mon, float dt) {
             info.isLayer || info.attached ? nullptr : wallFrameFor(info.window);
 
         if (FRAME)
-            entity.spawnScale = FRAME->width / World3D::toWorld(MONW);
+            entity.spawnScale = FRAME->width / World3D::toWorld(g_wallWork.w);
 
         // Seed pose: existing entities own their world position and rotation.
         // Next come the poses remembered from the last 3D session -- positions
@@ -2381,7 +2449,7 @@ static void syncWorld(const PHLMONITOR& mon, float dt) {
                 boxesDiffer(OLD->second.box, SEAT.box);
 
             if (MOVED) {
-                const SViewPose POSE = wallSeatPose(*FRAME, SEAT.box, SEAT.rank, mon);
+                const SViewPose POSE = wallSeatPose(*FRAME, SEAT.box, SEAT.rank);
                 entity.center = POSE.center;
                 entity.yaw    = POSE.yaw;
                 entity.pitch  = POSE.pitch;
@@ -2486,8 +2554,8 @@ static void syncWorld(const PHLMONITOR& mon, float dt) {
         // outline traced from the snapshot texture's real alpha (exact
         // corner shape; the GPU-side copy is the only reliable read), then
         // the analytic rounded rect (mask refresh failures, first frames),
-        // then GLScene's plain box.
-        render.depth = g_cfgWindowDepth;
+        // then GLScene's plain box. Wall windows are flat (see kSeatBase).
+        render.depth = g_wallSeats.count(entity.id) ? 0.0f : g_cfgWindowDepth;
 
         if (SNAPSHOT->outlines && !SNAPSHOT->outlines->empty())
             render.outlines = SNAPSHOT->outlines;
@@ -2525,8 +2593,9 @@ static void syncWorld(const PHLMONITOR& mon, float dt) {
                                             WALLPAPER->texID;
 
         if (TEX && WALLPAPER->texSpan.x > 0 && WALLPAPER->texSpan.y > 0) {
-            // Same top-down UV convention as the window quads above.
-            const CBox&    B    = WALLPAPER->sampledBox;
+            // Same top-down UV convention as the window quads above. A frame
+            // stands for the work area, so it shows the wallpaper under it.
+            const CBox&    B    = g_wallWork;
             const Vector2D SPAN = WALLPAPER->texSpan;
 
             g_scene.setHouseScreenTexture(
@@ -3243,13 +3312,11 @@ static bool boxesDiffer(const CBox& A, const CBox& B) {
 // rectangle is always the live box: the layout owns the real geometry in
 // both modes.
 static void buildEnterMorph(
-    const PHLMONITOR& mon, const std::vector<Compat::SWindowInfo>& infos) {
+    const PHLMONITOR& /*mon*/, const std::vector<Compat::SWindowInfo>& infos) {
     g_viewMorphWins.clear();
 
     const auto& CAM = g_scene.camera();
     const Vec3  FWD = CAM.forward();
-
-    const auto WALL_RANKS = wallRanks(infos);
 
     int i = 0;
 
@@ -3261,29 +3328,11 @@ static void buildEnterMorph(
         MW.box2D = SNAPSHOT ? SNAPSHOT->sampledBox : info.monitorLocalBox;
         MW.boxRoom = MW.box2D;
 
-        // The all-workspaces room: the shown workspace's windows fly from
-        // the screen onto their wall seats at their own size, and nothing is
-        // frozen or driven (see g_allWorkspaces). The other workspaces were
-        // never on screen, so they have nowhere to fly from: they fade in on
-        // their walls with the environment (see applyViewMorph).
-        if (const auto* FRAME =
-                info.isLayer || info.attached ? nullptr : wallFrameFor(info.window)) {
-            if (!info.window->m_workspace->isVisible())
-                continue;
-
-            const auto RANK_IT = WALL_RANKS.find(info.id);
-
-            MW.roomPose = wallSeatPose(
-                *FRAME, SNAPSHOT ? SNAPSHOT->fullBox : info.monitorLocalBox,
-                RANK_IT == WALL_RANKS.end() ? 0 : RANK_IT->second, mon);
-            MW.animBox = false;
-            MW.stack   = static_cast<float>(i) * kMorphStackEps;
-            MW.scale   = FRAME->width / World3D::toWorld(mon->m_size.x);
-            ++i;
-
-            g_viewMorphWins[info.id] = MW;
+        // The all-workspaces room: wall windows never fly. The camera does
+        // instead (see applyWallCamera), and nothing is frozen or driven
+        // (see g_allWorkspaces).
+        if (!info.isLayer && !info.attached && wallFrameFor(info.window))
             continue;
-        }
 
         if (const auto POSE = g_savedPoses.find(info.id);
             POSE != g_savedPoses.end()) {
@@ -3360,6 +3409,29 @@ static void beginExit3D() {
     if (g_fsPhase != EFullscreenPhase::None || !MON)
         return;
 
+    // The all-workspaces room leaves the way it came in, in reverse: the
+    // camera flies from wherever it is to the active frame filling the view,
+    // and the handoff to 2D happens there. "Wherever it is" is scaled so the
+    // flight continues from the current pose at the current progress, which
+    // matters when an entry is cut short.
+    if (g_allWorkspaces) {
+        const auto& CAM = g_scene.camera();
+
+        const auto* ACTIVE = MON->m_activeWorkspace ?
+            g_wallLayout.find(MON->m_activeWorkspace->m_id) :
+            nullptr;
+
+        g_wallCamNear = ACTIVE ? wallCamFilling(*ACTIVE) :
+                                 SWallCamPose{CAM.position, CAM.yaw, CAM.pitch};
+
+        const float S = std::max(g_morphS, 0.05f);
+
+        g_wallCamFar.position = g_wallCamNear.position +
+            (CAM.position - g_wallCamNear.position) * (1.0f / S);
+        g_wallCamFar.yaw   = g_wallCamNear.yaw + wrapPi(CAM.yaw - g_wallCamNear.yaw) / S;
+        g_wallCamFar.pitch = g_wallCamNear.pitch + (CAM.pitch - g_wallCamNear.pitch) / S;
+    }
+
     // An interrupted ENTER morph contributes its intended room poses.
     const auto PREVIOUS = std::move(g_viewMorphWins);
 
@@ -3374,32 +3446,10 @@ static void beginExit3D() {
     for (const auto& ENTITY : g_world.entities()) {
         SViewMorphWin MW;
 
-        // The all-workspaces room remembers nothing (the walls are rebuilt
-        // from the layouts every entry) and drives nothing, so a wall window
-        // lands on its live 2D box. Only the workspace being shown has
-        // somewhere to land; the rest fade out on their walls.
-        if (g_allWorkspaces && g_wallSeats.count(ENTITY.id)) {
-            const auto W = Compat::findWindowById(ENTITY.id);
-            if (!W || !W->m_workspace || !W->m_workspace->isVisible())
-                continue;
-
-            const auto* SNAPSHOT = g_capture.get(ENTITY.id);
-
-            MW.roomPose = SViewPose{
-                ENTITY.center, ENTITY.yaw, ENTITY.pitch, ENTITY.roll};
-            MW.boxRoom = SNAPSHOT ?
-                SNAPSHOT->sampledBox :
-                CBox{ENTITY.logicalLeft, ENTITY.logicalTop,
-                     ENTITY.logicalWidth, ENTITY.logicalHeight};
-            MW.box2D   = MW.boxRoom;
-            MW.animBox = false;
-            MW.stack   = static_cast<float>(i) * kMorphStackEps;
-            MW.scale   = ENTITY.spawnScale;
-            ++i;
-
-            g_viewMorphWins[ENTITY.id] = MW;
+        // The all-workspaces room: wall windows stay on their walls while
+        // the camera flies to the active frame (see applyWallCamera).
+        if (g_allWorkspaces && g_wallSeats.count(ENTITY.id))
             continue;
-        }
 
         // The intended room pose: mid-flight exits keep the destination.
         bool midEnter = false;
@@ -3530,8 +3580,7 @@ static void applyViewMorphWindows(const PHLMONITOR& mon, float s) {
         }
 
         // Exact 1:1 on the frustum plane at s=0, the room scale at s=1.
-        const float ROOM_SCALE = MW.scale > 0.0f ? MW.scale : configWindowScale();
-        const float SCALE = 1.0f + (ROOM_SCALE - 1.0f) * s;
+        const float SCALE = 1.0f + (configWindowScale() - 1.0f) * s;
 
         const auto SP = ScreenProject::project(
             CAM.position, CAM.yaw, CAM.pitch, CAM.mirrorView, g_scene.zoom(),
@@ -3556,6 +3605,28 @@ static void applyViewMorphWindows(const PHLMONITOR& mon, float s) {
         E->roll   = RW.roll;
         E->width  = RW.width;
         E->height = RW.height;
+    }
+}
+
+// The all-workspaces view morph flies the camera, not the windows: from the
+// pose where the active frame fills the view (s = 0) to the pose in the room
+// (s = 1), the angles the short way round. The player body is carried along,
+// or the first-person readback would pull the camera back to it.
+static void applyWallCamera(float s) {
+    auto& CAM = g_scene.camera();
+
+    CAM.position = g_wallCamNear.position +
+        (g_wallCamFar.position - g_wallCamNear.position) * s;
+    CAM.yaw   = g_wallCamNear.yaw + wrapPi(g_wallCamFar.yaw - g_wallCamNear.yaw) * s;
+    CAM.pitch = g_wallCamNear.pitch + (g_wallCamFar.pitch - g_wallCamNear.pitch) * s;
+
+    if (g_bodyIf && !g_playerBody.IsInvalid()) {
+        g_bodyIf->SetPositionAndRotation(
+            g_playerBody,
+            JPH::RVec3(CAM.position.x, CAM.position.y - PLAYER_EYE_OFF,
+                       CAM.position.z),
+            JPH::Quat::sIdentity(), JPH::EActivation::Activate);
+        g_bodyIf->SetLinearVelocity(g_playerBody, JPH::Vec3::sZero());
     }
 }
 
@@ -3596,12 +3667,20 @@ static void applyViewMorph(const PHLMONITOR& mon) {
     const float ENV_ALPHA = smoothstep01(std::min(1.0f, RAW * 2.0f));
     g_scene.setEnvAlpha(ENV_ALPHA);
 
-    // The all-workspaces walls that do not fly (the workspaces not on
-    // screen, see buildEnterMorph) come and go with the environment.
-    if (g_allWorkspaces)
+    // The all-workspaces room: the camera flies instead of the windows. The
+    // workspace being shown is what 2D shows at the handoff, so it stays
+    // solid; every other wall comes and goes with the environment.
+    if (g_allWorkspaces) {
+        applyWallCamera(g_morphS);
+
+        const WORKSPACEID ACTIVE =
+            mon->m_activeWorkspace ? mon->m_activeWorkspace->m_id : WORKSPACE_INVALID;
+
         for (auto& RW : g_renderWindows)
-            if (g_wallSeats.count(RW.id) && !g_viewMorphWins.count(RW.id))
+            if (const auto IT = g_wallSeats.find(RW.id);
+                IT != g_wallSeats.end() && IT->second.workspace != ACTIVE)
                 RW.alpha *= ENV_ALPHA;
+    }
 
     applyViewMorphWindows(mon, g_morphS);
 
@@ -4133,8 +4212,8 @@ static void enter3D() {
     }
 
     // windows.all_workspaces: the room is built from the workspaces as they
-    // stand right now, and the player stands in the middle of it facing the
-    // active one. Neither player.spawn nor the last session's camera applies:
+    // stand right now, and the view opens on the active one. Neither
+    // player.spawn nor the last session's camera applies:
     // both are points on the open grid, and inside a room sized by the
     // workspace count they land in a wall as often as not.
     g_allWorkspaces = g_cfgAllWorkspaces;
@@ -4144,26 +4223,40 @@ static void enter3D() {
     g_pendingSwitchFocus.reset();
 
     if (const auto MON = targetMonitor(); MON && g_allWorkspaces) {
+        const CBox WORK = MON->logicalBoxMinusReserved();
+
+        g_wallWork = WORK.w > 0 && WORK.h > 0 ?
+            CBox{WORK.x - MON->m_position.x, WORK.y - MON->m_position.y, WORK.w,
+                 WORK.h} :
+            CBox{0, 0, MON->m_size.x, MON->m_size.y};
+        g_wallMonSize = MON->m_size;
+
         g_wallLayout = WallLayout::compute(
             wallWorkspaces(MON),
-            World3D::toWorld(static_cast<float>(MON->m_size.x)) * g_cfgWallScale,
-            World3D::toWorld(static_cast<float>(MON->m_size.y)) * g_cfgWallScale);
+            World3D::toWorld(static_cast<float>(g_wallWork.w)) * g_cfgWallScale,
+            World3D::toWorld(static_cast<float>(g_wallWork.h)) * g_cfgWallScale);
 
-        auto& CAM    = g_scene.camera();
-        CAM.position = Vec3{0.0f, Camera::kFloorY + Camera::kEyeHeight, 0.0f};
-        CAM.pitch    = 0.0f;
-
+        // The view opens on the active frame filling the screen, exactly
+        // where 2D left off, and backs away from it into the room (see
+        // applyWallCamera).
         const auto* ACTIVE = MON->m_activeWorkspace ?
             g_wallLayout.find(MON->m_activeWorkspace->m_id) :
             nullptr;
 
         if (ACTIVE) {
-            // Inverse of Camera::forward(): {sin yaw cos pitch, sin pitch,
-            // -cos yaw cos pitch}.
-            const Vec3 TO = normalize(ACTIVE->center - CAM.position);
-            CAM.yaw   = std::atan2(TO.x, -TO.z);
-            CAM.pitch = std::asin(std::clamp(TO.y, -1.0f, 1.0f));
+            g_wallCamNear = wallCamFilling(*ACTIVE);
+            g_wallCamFar  = wallCamRoom(*ACTIVE);
+        } else {
+            g_wallCamNear = wallCamLookingAt(
+                Vec3{0.0f, Camera::kFloorY + Camera::kEyeHeight, 0.0f},
+                Vec3{0.0f, Camera::kFloorY + Camera::kEyeHeight, -1.0f});
+            g_wallCamFar = g_wallCamNear;
         }
+
+        auto& CAM    = g_scene.camera();
+        CAM.position = g_wallCamNear.position;
+        CAM.yaw      = g_wallCamNear.yaw;
+        CAM.pitch    = g_wallCamNear.pitch;
     }
 
     // world.house: walls around that room, for as long as the room stands.

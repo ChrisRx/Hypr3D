@@ -284,9 +284,9 @@ SHouse build(const SLayout& layout) {
 
         buildLabel(mesh, W, F, GROUP);
 
-        // A hair in front of the bezel face; windows seat further out still
-        // (kSeatBase in main.cpp).
-        house.screens.push_back({F.center + F.normal * 0.003f, F.yaw, F.width, F.height});
+        // A hair in front of the bezel face; windows seat further out still.
+        house.screens.push_back(
+            {F.center + F.normal * WallLayout::kScreenLift, F.yaw, F.width, F.height});
     }
 
     const int NX = std::clamp(static_cast<int>(std::lround(2.f * layout.halfX / kLightSpacing)), 1, kLightsPerSide);

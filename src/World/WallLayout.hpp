@@ -33,6 +33,14 @@ constexpr float kBezel = 0.12f;
 // the face, so everything mounted on it clears the wall by at least this.
 constexpr float kFrameDepth = 0.06f;
 
+// The layers on a frame face, as offsets along its normal: the screen (the
+// wallpaper behind a workspace) just off the bezel face, and the windows
+// further out. Each gap is several times the 24-bit depth resolution at the
+// far wall of the largest room; layers closer than that flicker between
+// each other as the camera moves.
+constexpr float kScreenLift = 0.0015f;
+constexpr float kWindowLift = 0.005f;
+
 // Between neighbouring frames on a wall, and between a frame and the corner.
 constexpr float kGap = 1.0f;
 
