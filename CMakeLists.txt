@@ -108,6 +108,7 @@ add_library(hypr3d SHARED
     src/Render/GLScene.cpp
     src/Render/MapModel.cpp
     src/Render/PlayerModel.cpp
+    src/World/House.cpp
     src/World/MapCollision.cpp
     src/World/Camera.cpp
     src/World/Outline.cpp

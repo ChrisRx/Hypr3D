@@ -1926,6 +1926,234 @@ void GLScene::drawWindows(
     glDepthMask(GL_TRUE);
 }
 
+void GLScene::setHouse(const House::SHouse& house) {
+    m_housePending = house.vertices;
+    m_houseLights  = house.lights;
+    m_houseScreens = house.screens;
+    m_houseDirty   = true;
+}
+
+void GLScene::clearHouse() {
+    m_housePending.clear();
+    m_houseLights.clear();
+    m_houseScreens.clear();
+    m_houseDirty    = true;
+    m_houseActive   = -1;
+    m_screenTexture = 0;
+}
+
+bool GLScene::ensureHouseProgram() {
+    if (m_houseProgram)
+        return true;
+
+    if (m_houseProgramFailed)
+        return false;
+
+    static constexpr const char* houseVertexShader = R"GLSL(
+#version 300 es
+
+layout(location = 0) in vec3 aPosition;
+layout(location = 1) in vec3 aNormal;
+layout(location = 2) in vec2 aTag; // material, frame (-1 = none)
+
+uniform mat4 uMVP;
+
+out vec3 vPos;
+out vec3 vNormal;
+flat out vec2 vTag;
+
+void main() {
+    gl_Position = uMVP * vec4(aPosition, 1.0);
+    vPos    = aPosition;
+    vNormal = aNormal;
+    vTag    = aTag;
+}
+)GLSL";
+
+    // Materials follow House::EMaterial. The patterns run off the world
+    // position, so the mesh needs no UVs and no textures.
+    static constexpr const char* houseFragmentShader = R"GLSL(
+#version 300 es
+
+precision highp float;
+
+in vec3 vPos;
+in vec3 vNormal;
+flat in vec2 vTag;
+
+uniform vec4  uLights[16]; // xyz position, w intensity
+uniform int   uLightCount;
+uniform float uActive;     // frame that lights up
+uniform vec3  uAccent;
+
+out vec4 fragColor;
+
+float hash(vec2 p) {
+    return fract(sin(dot(p, vec2(127.1, 311.7))) * 43758.5453);
+}
+
+void main() {
+    int  mat    = int(vTag.x + 0.5);
+    bool lit    = vTag.y >= 0.0 && abs(vTag.y - uActive) < 0.5; // the active frame
+    vec3 n      = normalize(vNormal);
+
+    vec3  albedo;
+    float glow = 0.0; // share of the colour that ignores the lighting
+
+    if (mat == 0) {
+        // Oak boards along x: 18 cm wide, 1.4 m long, every row staggered.
+        float row  = floor(vPos.z / 0.18);
+        float off  = hash(vec2(row, 7.0)) * 1.4;
+        float col  = floor((vPos.x + off) / 1.4);
+        float tone = 0.78 + 0.4 * hash(vec2(row, col));
+        float grain =
+            0.5 + 0.5 * sin((vPos.x + off) * 23.0 + 2.0 * sin(vPos.z * 41.0 + col));
+        albedo = vec3(0.50, 0.33, 0.20) * tone * (0.9 + 0.1 * grain);
+
+        float fz = fract(vPos.z / 0.18);
+        float fx = fract((vPos.x + off) / 1.4);
+        float seam = step(min(fz, 1.0 - fz) * 0.18, 0.004) +
+            step(min(fx, 1.0 - fx) * 1.4, 0.004);
+        albedo *= 1.0 - 0.5 * min(seam, 1.0);
+    } else if (mat == 1) {
+        // Warm plaster.
+        albedo = vec3(0.80, 0.76, 0.70);
+    } else if (mat == 2) {
+        albedo = vec3(0.90, 0.89, 0.86);
+    } else if (mat == 3) {
+        albedo = vec3(0.94, 0.93, 0.91);
+    } else if (mat == 4) {
+        albedo = lit ? uAccent * 0.9 : vec3(0.07, 0.075, 0.085);
+        glow   = lit ? 0.6 : 0.0;
+    } else if (mat == 5) {
+        albedo = lit ? uAccent : vec3(0.28, 0.27, 0.26);
+        glow   = lit ? 0.8 : 0.0;
+    } else {
+        albedo = vec3(1.0, 0.97, 0.9);
+        glow   = 1.0;
+    }
+
+    vec3 light = vec3(0.38, 0.38, 0.40) + 0.10 * vec3(n.y * 0.5 + 0.5);
+
+    for (int i = 0; i < 16; ++i) {
+        if (i >= uLightCount)
+            break;
+
+        vec3  L   = uLights[i].xyz - vPos;
+        float d2  = max(dot(L, L), 1e-4);
+        float ndl = max(dot(n, L * inversesqrt(d2)), 0.0);
+        light += vec3(1.0, 0.95, 0.86) * (uLights[i].w * ndl * 9.0 / (9.0 + d2));
+    }
+
+    fragColor = vec4(mix(albedo * light, albedo, glow), 1.0);
+}
+)GLSL";
+
+    const GLuint VS = compileShader(GL_VERTEX_SHADER, houseVertexShader);
+    const GLuint FS = VS ? compileShader(GL_FRAGMENT_SHADER, houseFragmentShader) : 0;
+
+    if (VS && FS)
+        m_houseProgram = linkProgram(VS, FS);
+
+    if (VS)
+        glDeleteShader(VS);
+    if (FS)
+        glDeleteShader(FS);
+
+    if (!m_houseProgram) {
+        m_houseProgramFailed = true;
+        return false;
+    }
+
+    m_houseMVP         = glGetUniformLocation(m_houseProgram, "uMVP");
+    m_houseLightsU     = glGetUniformLocation(m_houseProgram, "uLights");
+    m_houseLightCountU = glGetUniformLocation(m_houseProgram, "uLightCount");
+    m_houseActiveU     = glGetUniformLocation(m_houseProgram, "uActive");
+    m_houseAccentU     = glGetUniformLocation(m_houseProgram, "uAccent");
+
+    return true;
+}
+
+// Opaque and depth-writing, drawn with the scene objects after the panorama:
+// the house walls off everything outside it, the backdrop included, except
+// through the window openings. The view morph's environment fade covers it
+// like the rest of the environment.
+void GLScene::drawHouse(const Mat4& vp) {
+    if (m_houseDirty) {
+        m_houseDirty = false;
+
+        if (!m_houseVAO) {
+            glGenVertexArrays(1, &m_houseVAO);
+            glGenBuffers(1, &m_houseVBO);
+        }
+
+        constexpr GLsizei STRIDE = House::kVertexFloats * sizeof(float);
+
+        glBindVertexArray(m_houseVAO);
+        glBindBuffer(GL_ARRAY_BUFFER, m_houseVBO);
+        glBufferData(GL_ARRAY_BUFFER,
+                     static_cast<GLsizeiptr>(m_housePending.size() * sizeof(float)),
+                     m_housePending.empty() ? nullptr : m_housePending.data(),
+                     GL_STATIC_DRAW);
+        glEnableVertexAttribArray(0);
+        glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, STRIDE, reinterpret_cast<void*>(0));
+        glEnableVertexAttribArray(1);
+        glVertexAttribPointer(1, 3, GL_FLOAT, GL_FALSE, STRIDE,
+                              reinterpret_cast<void*>(3 * sizeof(float)));
+        glEnableVertexAttribArray(2);
+        glVertexAttribPointer(2, 2, GL_FLOAT, GL_FALSE, STRIDE,
+                              reinterpret_cast<void*>(6 * sizeof(float)));
+        glBindVertexArray(0);
+        glBindBuffer(GL_ARRAY_BUFFER, 0);
+
+        m_houseVertexCount =
+            static_cast<int>(m_housePending.size() / House::kVertexFloats);
+        m_housePending.clear();
+        m_housePending.shrink_to_fit();
+    }
+
+    if (m_houseVertexCount <= 0 || !ensureHouseProgram())
+        return;
+
+    glEnable(GL_DEPTH_TEST);
+    glDepthMask(GL_TRUE);
+    glDisable(GL_BLEND);
+
+    glUseProgram(m_houseProgram);
+    glUniformMatrix4fv(m_houseMVP, 1, GL_FALSE, vp.m.data());
+    glUniform1f(m_houseActiveU, static_cast<float>(m_houseActive));
+
+    // The active border green of the config this was written for.
+    glUniform3f(m_houseAccentU, 0.631f, 0.945f, 0.694f);
+
+    const int LIGHTS = std::min<int>(static_cast<int>(m_houseLights.size()),
+                                     kMaxHouseLights);
+    if (LIGHTS > 0)
+        glUniform4fv(m_houseLightsU, LIGHTS, m_houseLights.front().data());
+    glUniform1i(m_houseLightCountU, LIGHTS);
+
+    glBindVertexArray(m_houseVAO);
+    glDrawArrays(GL_TRIANGLES, 0, m_houseVertexCount);
+    glBindVertexArray(0);
+
+    // The screens: the wallpaper, so every frame reads as that workspace's
+    // desktop with its windows on it. Unit quads on the scene program, like
+    // the windows themselves.
+    static constexpr float DARK_UV[4] = {0.f, 0.f, 1.f, 1.f};
+
+    for (const auto& S : m_houseScreens) {
+        const Mat4 MODEL = Mat4::translation(S.center) * Mat4::rotationY(S.yaw) *
+            Mat4::scale({S.width, S.height, 1.0f});
+
+        if (m_screenTexture)
+            drawQuad(m_quadVAO, m_quadVertexCount, vp * MODEL, m_screenTexture,
+                     m_screenUV, 1.f, 1.f, 1.f, 1.f);
+        else
+            drawQuad(m_quadVAO, m_quadVertexCount, vp * MODEL, 0, DARK_UV,
+                     0.02f, 0.025f, 0.035f, 1.f);
+    }
+}
+
 // Restored from the pre-unification revision: the black cross with the
 // white outline at the screen centre (screen-space, scene program).
 void GLScene::drawCrosshair(int width, int height) {
@@ -2528,6 +2756,8 @@ bool GLScene::render(
         S.model->drawDebug(vp);
     }
 
+    drawHouse(vp);
+
     // The player's character (hidden in first person): animated inside
     // render -- the clock and the vertex upload need the EGL context.
     refreshPlayer();
@@ -2778,6 +3008,20 @@ void GLScene::shutdown() {
 }
 
 void GLScene::destroyGLObjects() {
+    if (m_houseVBO) {
+        glDeleteBuffers(1, &m_houseVBO);
+        m_houseVBO = 0;
+    }
+    if (m_houseVAO) {
+        glDeleteVertexArrays(1, &m_houseVAO);
+        m_houseVAO = 0;
+    }
+    if (m_houseProgram) {
+        glDeleteProgram(m_houseProgram);
+        m_houseProgram = 0;
+    }
+    m_houseVertexCount = 0;
+
     if (m_textVBO) {
         glDeleteBuffers(1, &m_textVBO);
         m_textVBO = 0;

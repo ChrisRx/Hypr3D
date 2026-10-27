@@ -3,10 +3,12 @@
 #include "Render/MapModel.hpp"
 #include "Render/PlayerModel.hpp"
 #include "World/Camera.hpp"
+#include "World/House.hpp"
 #include "World/Outline.hpp"
 #include "World/Picking.hpp"
 
 #include <algorithm>
+#include <array>
 #include <cstdint>
 #include <filesystem>
 #include <memory>
@@ -208,6 +210,31 @@ class GLScene {
         m_gridVisible = on;
     }
 
+    // --- world.house ----------------------------------------------------------
+
+    // The house to draw (see World/House.hpp). Only copied here; the GL
+    // upload happens in render(), where the EGL context is current. An empty
+    // house removes it.
+    void setHouse(const House::SHouse& house);
+    void clearHouse();
+
+    // The frame (index into the house's frames) that lights up: the active
+    // workspace. -1 for none.
+    void setHouseActive(int frame) {
+        m_houseActive = frame;
+    }
+
+    // What every screen shows (the wallpaper) as a texture and its UV
+    // subrect in the WindowRender convention. Texture 0 leaves them dark.
+    void setHouseScreenTexture(unsigned int texture, float u0, float v0,
+                               float u1, float v1) {
+        m_screenTexture = texture;
+        m_screenUV[0]   = u0;
+        m_screenUV[1]   = v0;
+        m_screenUV[2]   = u1;
+        m_screenUV[3]   = v1;
+    }
+
     // --- scene: an arbitrary number of glTF objects -------------------------
 
     // One object's render-relevant config (index-aligned with the slots).
@@ -294,6 +321,8 @@ class GLScene {
     void refreshPanorama();
 
     void drawWindows(const Mat4& vp, const std::vector<WindowRender>& windows);
+    void drawHouse(const Mat4& vp);
+    bool ensureHouseProgram();
     void drawFullscreen(float alpha, bool perPixel);
     void drawCrosshair(int width, int height);
     void drawPointer(const Mat4& vp, int width, int height);
@@ -423,6 +452,32 @@ class GLScene {
     bool          m_probeRequested = false;
     bool          m_probeValid     = false;
     unsigned char m_probe[4]       = {0, 0, 0, 0};
+
+    // world.house. The program is built on first use, not in
+    // createPrograms(): a driver that rejects it costs the house, not the
+    // whole view.
+    static constexpr int kMaxHouseLights = 16;
+
+    unsigned int m_houseProgram       = 0;
+    bool         m_houseProgramFailed = false;
+    int          m_houseMVP           = -1;
+    int          m_houseLightsU       = -1;
+    int          m_houseLightCountU   = -1;
+    int          m_houseActiveU       = -1;
+    int          m_houseAccentU       = -1;
+
+    unsigned int m_houseVAO         = 0;
+    unsigned int m_houseVBO         = 0;
+    int          m_houseVertexCount = 0;
+
+    std::vector<float>                m_housePending; // awaiting upload
+    bool                              m_houseDirty = false;
+    std::vector<std::array<float, 4>> m_houseLights;
+    std::vector<House::SScreen>       m_houseScreens;
+    int                               m_houseActive = -1;
+
+    unsigned int m_screenTexture = 0;
+    float        m_screenUV[4]   = {0.f, 1.f, 1.f, 0.f};
 };
 
 } // namespace H3D

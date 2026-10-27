@@ -27,6 +27,7 @@
 #include <hyprland/src/render/gl/GLFramebuffer.hpp>
 #include <hyprland/src/output/Monitor.hpp>
 #include <hyprland/src/desktop/view/Window.hpp>
+#include <hyprland/src/desktop/view/LayerSurface.hpp>
 #include <hyprland/src/desktop/Workspace.hpp>
 #include <hyprland/src/managers/SeatManager.hpp>
 #include <hyprland/src/managers/eventLoop/EventLoopManager.hpp>
@@ -60,6 +61,7 @@ extern "C" {
 #include "Input/AimFocus.hpp"
 #include "Input/InputController.hpp"
 #include "World/MapCollision.hpp"
+#include "World/House.hpp"
 #include "World/ScreenProject.hpp"
 #include "World/WallLayout.hpp"
 #include "World/World3D.hpp"
@@ -194,6 +196,25 @@ static constexpr float kWorkspaceDwell = 0.25f;
 // That focus, once the dwell is over, waiting for the frame pump: it is
 // decided inside the frame but has to run outside it (see updateAimFocus).
 static PHLWINDOWREF g_pendingSwitchFocus;
+
+// --- the house (world.house) ------------------------------------------------
+//
+// Built around g_wallLayout at entry and torn down at exit, so it is exactly
+// as long-lived as the layout it encloses. It stands on its own floor, and
+// takes the grid platform's place (visual and collision slab both) for as
+// long as it stands.
+static bool                     g_houseActive = false;
+static House::SHouse            g_house;
+static std::vector<JPH::BodyID> g_houseBodies;
+
+// Fresh spawns are kept this far inside the walls (see syncWorld).
+static constexpr float kWallClearance = 0.6f;
+
+// The screens show the monitor's wallpaper, captured like any layer but in a
+// capture of its own: the room never shows the wallpaper, so
+// refreshCaptures' retainOnly would drop it.
+static Compat::CWindowCapture g_wallpaperCapture;
+static std::uintptr_t         g_wallpaperId = 0;
 
 // --- 2D/3D independent positions + the view morph ---------------------------
 //
@@ -513,8 +534,13 @@ static bool        g_cfgAllWorkspaces = false;
 // workspace that has no wall.
 static float       g_cfgWallScale = 0.35f;
 
+// world.house: build a house around the all-workspaces room (World/House.hpp).
+// Needs windows.all_workspaces (without it there is no room to build
+// around) and like it, is read once per entry.
+static bool        g_cfgHouse = false;
+
 static void liftAboveFloor(Vec3& center, float height) {
-    if (!g_cfgGrid)
+    if (!g_cfgGrid && !g_houseActive)
         return;
 
     const float MIN_Y = Camera::kFloorY + kFloorClearance + height * 0.5f;
@@ -820,7 +846,10 @@ static void syncFloorBody() {
     if (!g_joltSystem)
         return;
 
-    if (g_cfgGrid && g_floorBody.IsInvalid()) {
+    // The house brings its own floor.
+    const bool WANT = g_cfgGrid && !g_houseActive;
+
+    if (WANT && g_floorBody.IsInvalid()) {
         JPH::BoxShapeSettings SLAB(JPH::Vec3(20.0f, 0.5f, 20.0f));
         SLAB.SetEmbedded();
         auto RES = SLAB.Create();
@@ -835,11 +864,79 @@ static void syncFloorBody() {
             return;
         g_bodyIf->AddBody(B->GetID(), JPH::EActivation::DontActivate);
         g_floorBody = B->GetID();
-    } else if (!g_cfgGrid && !g_floorBody.IsInvalid()) {
+    } else if (!WANT && !g_floorBody.IsInvalid()) {
         g_bodyIf->RemoveBody(g_floorBody);
         g_bodyIf->DestroyBody(g_floorBody);
         g_floorBody = JPH::BodyID();
     }
+}
+
+// The house as static boxes: walls (around their openings), floor, ceiling
+// and the glass in every opening.
+static void clearHouseBodies() {
+    if (g_bodyIf)
+        for (const auto& ID : g_houseBodies) {
+            g_bodyIf->RemoveBody(ID);
+            g_bodyIf->DestroyBody(ID);
+        }
+
+    g_houseBodies.clear();
+}
+
+static void buildHouseBodies() {
+    clearHouseBodies();
+
+    if (!g_joltSystem || !g_bodyIf)
+        return;
+
+    for (const auto& S : g_house.solids) {
+        const Vec3 HALF = (S.hi - S.lo) * 0.5f;
+        const Vec3 MID  = S.lo + HALF;
+
+        if (!(HALF.x > 0.f) || !(HALF.y > 0.f) || !(HALF.z > 0.f))
+            continue;
+
+        // Jolt's default convex radius (5 cm) is larger than the glass is
+        // thick; the radius may not exceed the smallest half extent.
+        JPH::BoxShapeSettings BOX(JPH::Vec3(HALF.x, HALF.y, HALF.z),
+                                  std::min({HALF.x, HALF.y, HALF.z, 0.05f}));
+        BOX.SetEmbedded();
+
+        auto RES = BOX.Create();
+        if (RES.HasError())
+            continue;
+
+        JPH::BodyCreationSettings BCS(
+            RES.Get(), JPH::RVec3(MID.x, MID.y, MID.z), JPH::Quat::sIdentity(),
+            JPH::EMotionType::Static, LAYER_STATIC);
+
+        auto* B = g_bodyIf->CreateBody(BCS);
+        if (!B)
+            continue;
+
+        g_bodyIf->AddBody(B->GetID(), JPH::EActivation::DontActivate);
+        g_houseBodies.push_back(B->GetID());
+    }
+}
+
+// Distance from `p` (inside the house) along `dir` to its inside faces.
+static float houseExitDistance(const Vec3& p, const Vec3& dir) {
+    const float LO[3]  = {-g_wallLayout.halfX, Camera::kFloorY, -g_wallLayout.halfZ};
+    const float HI[3]  = {g_wallLayout.halfX, g_wallLayout.height, g_wallLayout.halfZ};
+    const float POS[3] = {p.x, p.y, p.z};
+    const float DIR[3] = {dir.x, dir.y, dir.z};
+
+    float t = 1e9f;
+
+    for (int axis = 0; axis < 3; ++axis) {
+        if (std::fabs(DIR[axis]) < 1e-6f)
+            continue;
+
+        const float BOUND = DIR[axis] > 0.f ? HI[axis] : LO[axis];
+        t = std::min(t, (BOUND - POS[axis]) / DIR[axis]);
+    }
+
+    return std::max(t, 0.0f);
 }
 
 // Ground probe: a short ray straight down from the body center (feet with
@@ -1694,6 +1791,47 @@ static void refreshCaptures(
     ++g_captureFrames;
 }
 
+// The house screens' wallpaper: the topmost visible surface on the monitor's
+// background layer, or failing that a monitor-covering one on the bottom
+// layer (where Quickshell's background module draws). Captured with the rest
+// from render.pre, and only retaken when its buffer changes, like any other
+// layer.
+static void refreshWallpaper(const PHLMONITOR& mon) {
+    constexpr size_t LAYER_BACKGROUND = 0;
+    constexpr size_t LAYER_BOTTOM     = 1;
+
+    PHLLS wallpaper;
+
+    for (const auto& LSREF : mon->m_layerSurfaceLayers[LAYER_BACKGROUND]) {
+        const auto LS = LSREF.lock();
+
+        if (LS && LS->visible())
+            wallpaper = LS;
+    }
+
+    if (!wallpaper)
+        for (const auto& LSREF : mon->m_layerSurfaceLayers[LAYER_BOTTOM]) {
+            const auto LS  = LSREF.lock();
+            const auto BOX = LS && LS->visible() ? LS->surfaceLogicalBox() :
+                                                   std::nullopt;
+
+            if (BOX && BOX->w >= mon->m_size.x * 0.95 &&
+                BOX->h >= mon->m_size.y * 0.95)
+                wallpaper = LS;
+        }
+
+    const std::uintptr_t ID =
+        wallpaper ? reinterpret_cast<std::uintptr_t>(wallpaper.get()) : 0;
+
+    if (ID != g_wallpaperId) {
+        g_wallpaperCapture.releaseAll();
+        g_wallpaperId = ID;
+    }
+
+    if (wallpaper)
+        g_wallpaperCapture.makeSnapshotLayer(wallpaper, mon);
+}
+
 // Called from render.pre. Hyprland emits render.pre before beginRender() and
 // before the compositor's main render pass, so makeSnapshotFB can safely open
 // its own offscreen render here. Nested snapshot renders set g_capturing and
@@ -1731,6 +1869,9 @@ static void serviceCapture() {
             ghostWindows(MON, &INFOS);
         refreshCaptures(INFOS, MON);
     }
+
+    if (g_houseActive)
+        refreshWallpaper(MON);
 
     g_capturing = false;
 }
@@ -2192,6 +2333,12 @@ static void syncWorld(const PHLMONITOR& mon, float dt) {
             if (const auto WIN = g_world.pick(CAM.position, FWD);
                 WIN.hit && WIN.distance < dist + 0.15f)
                 dist = std::max(0.5f, WIN.distance - 0.15f);
+            // The house walls are not scene geometry, so the wall check
+            // above does not see them.
+            if (g_houseActive)
+                dist = std::min(
+                    dist, std::max(0.5f, houseExitDistance(CAM.position, FWD) -
+                                             kWallClearance));
 
             entity.center = CAM.position + FWD * dist;
 
@@ -2366,6 +2513,38 @@ static void syncWorld(const PHLMONITOR& mon, float dt) {
         render.v1 = std::clamp(entity.logicalTop / SPANH, 0.0f, 1.0f);
 
         g_renderWindows.push_back(render);
+    }
+
+    // The house: the screens get the wallpaper as it was captured this frame,
+    // and the active workspace's frame lights up. It follows the aim, since
+    // focusing a window on another wall switches to its workspace.
+    if (g_houseActive) {
+        const auto* WALLPAPER = g_wallpaperCapture.get(g_wallpaperId);
+        const unsigned int TEX = !WALLPAPER ? 0 :
+            WALLPAPER->bigTex             ? WALLPAPER->bigTex :
+                                            WALLPAPER->texID;
+
+        if (TEX && WALLPAPER->texSpan.x > 0 && WALLPAPER->texSpan.y > 0) {
+            // Same top-down UV convention as the window quads above.
+            const CBox&    B    = WALLPAPER->sampledBox;
+            const Vector2D SPAN = WALLPAPER->texSpan;
+
+            g_scene.setHouseScreenTexture(
+                TEX, static_cast<float>(B.x / SPAN.x),
+                static_cast<float>((B.y + B.h) / SPAN.y),
+                static_cast<float>((B.x + B.w) / SPAN.x),
+                static_cast<float>(B.y / SPAN.y));
+        } else
+            g_scene.setHouseScreenTexture(0, 0.f, 0.f, 1.f, 1.f);
+
+        int active = -1;
+
+        if (mon->m_activeWorkspace)
+            for (size_t i = 0; i < g_wallLayout.frames.size(); ++i)
+                if (g_wallLayout.frames[i].id == mon->m_activeWorkspace->m_id)
+                    active = static_cast<int>(i);
+
+        g_scene.setHouseActive(active);
     }
 
     // Aim focus updates freeze during the fullscreen transition: the flying
@@ -3782,6 +3961,13 @@ static void deactivate3D() {
     g_wallSeats.clear();
     g_dwellId = 0;
 
+    g_houseActive = false;
+    g_house       = {};
+    g_scene.clearHouse();
+    clearHouseBodies();
+    g_wallpaperCapture.releaseAll();
+    g_wallpaperId = 0;
+
     // Fullscreen passthrough state: back to plain 3D-off. Restore the real
     // box if a transition was mid-flight (the window would otherwise stay
     // monitor-sized). The restore box is the honest pre-FS box now -- the
@@ -3978,6 +4164,19 @@ static void enter3D() {
             CAM.yaw   = std::atan2(TO.x, -TO.z);
             CAM.pitch = std::asin(std::clamp(TO.y, -1.0f, 1.0f));
         }
+    }
+
+    // world.house: walls around that room, for as long as the room stands.
+    g_houseActive = g_allWorkspaces && g_cfgHouse && !g_wallLayout.empty();
+
+    if (g_houseActive) {
+        g_house = House::build(g_wallLayout);
+        g_scene.setHouse(g_house);
+        buildHouseBodies();
+    } else {
+        g_house = {};
+        g_scene.clearHouse();
+        clearHouseBodies();
     }
 
     g_capture.releaseAll();
@@ -4259,7 +4458,7 @@ static void update3D(float dt) {
     }
 
     g_scene.setSceneObjects(SPECS);
-    g_scene.setGridVisible(g_cfgGrid);
+    g_scene.setGridVisible(g_cfgGrid && !g_houseActive);
 
     // Frame rate for the F3 HUD: slow exponential average over dt.
     if (dt > 0.0f)
@@ -6587,6 +6786,9 @@ static int luaConfig(lua_State* L) {
     //         panorama = "~/picture.png",   -- 360-degree room background
     //         grid = true,                  -- base grid platform (visible +
     //                                       -- collidable, at world zero)
+    //         house = false,                -- a house around the
+    //                                       -- all_workspaces room (needs
+    //                                       -- windows.all_workspaces)
     //     },
     //     windows = {
     //         window_scale = 0.5,           -- room multiplier on window size
@@ -6760,6 +6962,8 @@ static int luaConfig(lua_State* L) {
             return luaL_error(L, "hypr3d.config: world.under_layers must be a boolean");
         if (!SET_BOOL(idx, "grid", g_cfgGrid, "world.grid"))
             return luaL_error(L, "hypr3d.config: world.grid must be a boolean");
+        if (!SET_BOOL(idx, "house", g_cfgHouse, "world.house"))
+            return luaL_error(L, "hypr3d.config: world.house must be a boolean");
         lua_pop(L, 1);
     }
 

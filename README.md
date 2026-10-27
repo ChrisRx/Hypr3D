@@ -181,6 +181,7 @@ Everything is optional -- only set what you want to change.
 | --------------| --------| ---------| -----------------------------------------------------------------------------------------------------------------------------------------------------------------------|
 | panorama     | string | ""      | 360° background image (equirectangular)                                                                                                                               |
 | grid         | bool   | true    | the starting 40x40 platform                                                                                                                                           |
+| house        | bool   | false   | a house around the all_workspaces room: floor, walls, ceiling lights, a labelled frame per workspace with the wallpaper behind its windows, and picture windows onto the panorama. replaces the grid while it stands |
 | monitor      | string | ""      | render the 3D view on this monitor (e.g. "DP-1") instead of the focused one                                                                                           |
 | under_layers | bool   | true    | draw the room under the top and overlay layers: bars, launchers, sidebars and notifications (e.g. Quickshell) stay 2D on top. only bottom-layer widgets join the room |
 
