@@ -142,10 +142,24 @@ static void bspBuild(SBspNode& node, std::vector<SWPoly>& polys, int depth) {
             neg = neg || dist[i] < -1e-4f;
         }
 
-        if (!pos) {
+        // Four cases, and the behind-only one has to be spelled out. `!pos`
+        // alone is true both for a coplanar polygon AND for one lying wholly
+        // BEHIND the plane, so the behind-only polygons used to be filed as
+        // coplanar: they were emitted at the node's own point in the
+        // traversal instead of inside the back subtree, which is the one
+        // place the order is guaranteed to be wrong. The symptom is a window
+        // that vanishes rather than one that merely blends oddly -- these
+        // quads write depth, so a nearer window drawn first depth-rejects
+        // the farther one for good. (With the eye on the plane's positive
+        // side the misfiling happens to land in roughly the right place,
+        // which is why it survives a two-window test; walk around to the
+        // other side and the same pair inverts.)
+        if (!pos && !neg) {
             node.coplanar.push_back(std::move(POLY));
         } else if (!neg) {
             frontList.push_back(std::move(POLY));
+        } else if (!pos) {
+            backList.push_back(std::move(POLY));
         } else {
             SWPoly front, back;
             bool hasFront = false, hasBack = false;
