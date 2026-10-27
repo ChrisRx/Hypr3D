@@ -208,6 +208,16 @@ static float g_morphS = 1.0f;
 // to the eye per list layer (~1 px of projection error, invisible).
 static constexpr float kMorphStackEps = 0.012f;
 
+// A fresh spawn is centred on the camera's eye line, and the grid platform
+// is opaque and drawn before the windows with depth writes on, so any part
+// of a quad below the floor is depth-rejected. A window taller than twice
+// the eye height (anything over ~650 logical px at the default scale, so
+// most tiled windows) lost its bottom, which reads as the wrong aspect ratio
+// rather than a crop. Fresh spawns are raised to clear the floor by this
+// much instead (liftAboveFloor); poses the player chose (drags, saved poses)
+// are left alone.
+static constexpr float kFloorClearance = 0.05f;
+
 // What to draw this frame, rebuilt once per frame from the world.
 static std::vector<GLScene::WindowRender> g_renderWindows;
 
@@ -442,6 +452,16 @@ static bool        g_cfgUnderLayers = true;
 static float       g_cfgWindowScale   = 0.5f;    // room multiplier on window size
 static float       g_cfgSpawnDistance = 5.0f;    // units in front of the camera
 static float       g_cfgWindowDepth   = 0.05f;   // slab thickness, 0 = flat quads
+
+static void liftAboveFloor(Vec3& center, float height) {
+    if (!g_cfgGrid)
+        return;
+
+    const float MIN_Y = Camera::kFloorY + kFloorClearance + height * 0.5f;
+
+    if (center.y < MIN_Y)
+        center.y = MIN_Y;
+}
 
 // --- player -----------------------------------------------------------------
 static float       g_cfgLookInertia   = 0.03f;   // seconds, 0 = off
@@ -1861,6 +1881,8 @@ static void syncWorld(const PHLMONITOR& mon, float dt) {
         // camera at a fixed read distance, facing it.
         // NEW windows spawn straight in front of the camera at a fixed read
         // distance, facing it.
+        bool freshSpawn = false;
+
         if (info.attached) {
             // Popups and X11 menus sit on their parent window's plane at
             // their real offset from it (so a menu opens where it was
@@ -1963,6 +1985,7 @@ static void syncWorld(const PHLMONITOR& mon, float dt) {
             // and pitch.
             entity.yaw   = std::atan2(-FWD.x, -FWD.z);
             entity.pitch = std::asin(std::clamp(FWD.y, -1.0f, 1.0f));
+            freshSpawn   = true;
         }
 
         // The quad size follows the snapshot box (times the config scale):
@@ -1973,6 +1996,9 @@ static void syncWorld(const PHLMONITOR& mon, float dt) {
         // to the 2D box).
         entity.width  = World3D::toWorld(BOX.w) * entity.spawnScale;
         entity.height = World3D::toWorld(BOX.h) * entity.spawnScale;
+
+        if (freshSpawn)
+            liftAboveFloor(entity.center, entity.height);
 
         // Fullscreen transition: the animation owns this quad's size, and it
         // MUST be applied here -- the draw list below is built from these
@@ -2817,6 +2843,9 @@ static void buildEnterMorph(
             MW.roomPose.yaw    = std::atan2(-FWD.x, -FWD.z);
             MW.roomPose.pitch  = std::asin(std::clamp(FWD.y, -1.0f, 1.0f));
             MW.roomPose.roll   = 0.0f;
+
+            liftAboveFloor(MW.roomPose.center,
+                           World3D::toWorld(MW.boxRoom.h) * configWindowScale());
         }
 
         MW.animBox = info.window && boxesDiffer(MW.box2D, MW.boxRoom);
